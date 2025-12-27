@@ -412,9 +412,13 @@ class T3(nn.Module):
         return predicted_tokens
 
     @torch.inference_mode()
-    def inference_turbo(self, t3_cond, text_tokens, temperature=0.8, top_k=1000, top_p=0.95, repetition_penalty=1.2,
+    def inference_turbo(self, t3_cond, text_tokens, attention_mask=None, temperature=0.8, top_k=1000, top_p=0.95, repetition_penalty=1.2,
                         max_gen_len=1000):
+        
+        batch_size = text_tokens.size(0)
+        device = text_tokens.device
 
+        # --- 1. Logits Processors Setup ---
         logits_processors = LogitsProcessorList()
         if temperature > 0 and temperature != 1.0:
             logits_processors.append(TemperatureLogitsWarper(temperature))
@@ -425,19 +429,37 @@ class T3(nn.Module):
         if repetition_penalty != 1.0:
             logits_processors.append(RepetitionPenaltyLogitsProcessor(repetition_penalty))
 
-
-        speech_start_token = self.hp.start_speech_token * torch.ones_like(text_tokens[:, :1])
-        embeds, _ = self.prepare_input_embeds(
+        # --- 2. Input Preparation ---
+        speech_start_token = self.hp.start_speech_token * torch.ones((batch_size, 1), dtype=torch.long, device=device)
+        
+        embeds, len_cond = self.prepare_input_embeds(
             t3_cond=t3_cond,
             text_tokens=text_tokens,
             speech_tokens=speech_start_token,
             cfg_weight=0.0,
         )
 
-        generated_speech_tokens = []
+        # --- 3. Attention Mask Construction (Fixing Input Padding) ---
+        # Structure of embeds: [Conditioning | Text | Speech_Start]
+        # We need a mask that is 1 for valid data and 0 for padding.
+        
+        if attention_mask is not None:
+            # Mask for Conditioning (Always 1)
+            cond_mask = torch.ones((batch_size, len_cond), dtype=torch.long, device=device)
+            # Mask for Speech Start (Always 1)
+            speech_mask = torch.ones((batch_size, 1), dtype=torch.long, device=device)
+            
+            # Combine: [111... | 1100... (Text Mask) | 1 ]
+            combined_mask = torch.cat([cond_mask, attention_mask, speech_mask], dim=1)
+        else:
+            combined_mask = None
 
+        generated_speech_tokens = []
+        
+        # --- 4. First Forward Pass ---
         llm_outputs = self.tfmr(
             inputs_embeds=embeds,
+            attention_mask=combined_mask, 
             use_cache=True
         )
 
@@ -454,11 +476,20 @@ class T3(nn.Module):
         generated_speech_tokens.append(next_speech_token)
         current_speech_token = next_speech_token
 
-        for _ in tqdm(range(max_gen_len)):
+        # --- 5. Batch Generation Loop ---
+        unfinished_sequences = torch.ones(batch_size, dtype=torch.bool, device=device)
+
+        for _ in tqdm(range(max_gen_len), desc="T3 Batch Gen", leave=False):
+            # Update Mask for the new token (Always 1)
+            if combined_mask is not None:
+                new_mask_col = torch.ones((batch_size, 1), dtype=torch.long, device=device)
+                combined_mask = torch.cat([combined_mask, new_mask_col], dim=1)
+
             current_speech_embed = self.speech_emb(current_speech_token)
 
             llm_outputs = self.tfmr(
                 inputs_embeds=current_speech_embed,
+                attention_mask=combined_mask,
                 past_key_values=past_key_values,
                 use_cache=True
             )
@@ -467,8 +498,11 @@ class T3(nn.Module):
             past_key_values = llm_outputs.past_key_values
             speech_logits = self.speech_head(hidden_states)
 
+            # Repetition Penalty Input
             input_ids = torch.cat(generated_speech_tokens, dim=1)
+            
             processed_logits = logits_processors(input_ids, speech_logits[:, -1, :])
+            
             if torch.all(processed_logits == -float("inf")):
                 print("Warning: All logits are -inf")
                 break
@@ -476,15 +510,29 @@ class T3(nn.Module):
             probs = F.softmax(processed_logits, dim=-1)
             next_speech_token = torch.multinomial(probs, num_samples=1)
 
+            # --- 6. Smart Batch Masking ---
+            # Check for EOS
+            is_eos = (next_speech_token == self.hp.stop_speech_token).squeeze(-1)
+            
+            if batch_size > 1:
+                # If sequence was already finished, keeps it finished
+                # If sequence just hit EOS, mark it finished
+                newly_finished = unfinished_sequences & is_eos
+                unfinished_sequences = unfinished_sequences & ~newly_finished
+
+                # Force output to be STOP token for any sequence that is finished
+                # This ensures we pad with clean EOS tokens, not garbage
+                next_speech_token[~unfinished_sequences] = self.hp.stop_speech_token
+
+                if not unfinished_sequences.any():
+                    break
+            else:
+                if is_eos.item():
+                    break
+
             generated_speech_tokens.append(next_speech_token)
             current_speech_token = next_speech_token
-            if torch.all(next_speech_token == self.hp.stop_speech_token):
-                break
 
         all_tokens = torch.cat(generated_speech_tokens, dim=1)
-
-        # Remove EOS token if present
-        if all_tokens.size(1) > 0 and all_tokens[0, -1] == self.hp.stop_speech_token:
-            all_tokens = all_tokens[:, :-1]
 
         return all_tokens
