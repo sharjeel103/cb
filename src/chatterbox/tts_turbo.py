@@ -244,7 +244,72 @@ class ChatterboxTurboTTS:
             emotion_adv=exaggeration * torch.ones(1, 1, 1),
         ).to(device=self.device)
         self.conds = Conditionals(t3_cond, s3gen_ref_dict)
+        
+    def prepare_conditionals_batch(self, wav_fpaths: list[str], exaggeration=0.5, norm_loudness=True):
+        """
+        Prepares a batch of conditionals. 
+        wav_fpaths: List of file paths (equal to batch size) OR single file path (broadcasted).
+        """
+        if isinstance(wav_fpaths, str):
+            wav_fpaths = [wav_fpaths]
 
+        t3_conds_list = []
+        gen_refs_list = []
+
+        for wav_fpath in wav_fpaths:
+            # Re-using the single logic to safely process each audio file
+            
+            ## Load and norm reference wav
+            s3gen_ref_wav, _sr = librosa.load(wav_fpath, sr=S3GEN_SR)
+            assert len(s3gen_ref_wav) / _sr > 5.0, f"Audio prompt {wav_fpath} must be > 5s!"
+
+            if norm_loudness:
+                s3gen_ref_wav = self.norm_loudness(s3gen_ref_wav, _sr)
+
+            ref_16k_wav = librosa.resample(s3gen_ref_wav, orig_sr=S3GEN_SR, target_sr=S3_SR)
+
+            # S3Gen Conditioning (Prompt Feats)
+            s3gen_ref_wav_trunc = s3gen_ref_wav[:self.DEC_COND_LEN]
+            s3gen_ref_dict = self.s3gen.embed_ref(s3gen_ref_wav_trunc, S3GEN_SR, device=self.device)
+            gen_refs_list.append(s3gen_ref_dict)
+
+            # T3 Conditioning
+            t3_cond_prompt_tokens = None
+            if plen := self.t3.hp.speech_cond_prompt_len:
+                s3_tokzr = self.s3gen.tokenizer
+                # Note: s3_tokzr.forward usually expects batch, so wrapping in list
+                t3_cond_prompt_tokens, _ = s3_tokzr.forward([ref_16k_wav[:self.ENC_COND_LEN]], max_len=plen)
+                t3_cond_prompt_tokens = torch.atleast_2d(t3_cond_prompt_tokens).to(self.device)
+
+            ve_embed = torch.from_numpy(self.ve.embeds_from_wavs([ref_16k_wav], sample_rate=S3_SR))
+            ve_embed = ve_embed.mean(axis=0, keepdim=True).to(self.device)
+
+            t3_cond_item = T3Cond(
+                speaker_emb=ve_embed,
+                cond_prompt_speech_tokens=t3_cond_prompt_tokens,
+                emotion_adv=exaggeration * torch.ones(1, 1, 1).to(self.device),
+            )
+            t3_conds_list.append(t3_cond_item)
+
+        # --- Collate Batch ---
+        
+        # 1. Collate T3 Conds (Stack tensors)
+        batched_speaker_emb = torch.cat([c.speaker_emb for c in t3_conds_list], dim=0)
+        # Note: Handling None for prompt tokens if disabled in config, but usually enabled for Turbo
+        batched_speech_tokens = torch.cat([c.cond_prompt_speech_tokens for c in t3_conds_list], dim=0)
+        batched_emotion = torch.cat([c.emotion_adv for c in t3_conds_list], dim=0)
+        
+        batched_t3_cond = T3Cond(
+            speaker_emb=batched_speaker_emb,
+            cond_prompt_speech_tokens=batched_speech_tokens,
+            emotion_adv=batched_emotion,
+        ).to(self.device)
+        
+        # 2. S3Gen refs remain a list of dicts because S3Gen will run sequentially
+        self.conds_batch = {
+            "t3": batched_t3_cond,
+            "gen_list": gen_refs_list
+        }
    def generate_batch(
         self,
         texts: list[str],
