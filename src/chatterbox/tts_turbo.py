@@ -245,52 +245,82 @@ class ChatterboxTurboTTS:
         ).to(device=self.device)
         self.conds = Conditionals(t3_cond, s3gen_ref_dict)
 
-    def generate(
+   def generate_batch(
         self,
-        text,
+        texts: list[str],
+        audio_prompt_paths: list[str] = None,
         repetition_penalty=1.2,
-        min_p=0.00,
         top_p=0.95,
-        audio_prompt_path=None,
-        exaggeration=0.0,
-        cfg_weight=0.0,
         temperature=0.8,
         top_k=1000,
+        exaggeration=0.0,
         norm_loudness=True,
     ):
-        if audio_prompt_path:
-            self.prepare_conditionals(audio_prompt_path, exaggeration=exaggeration, norm_loudness=norm_loudness)
+        batch_size = len(texts)
+        
+        # ... (Audio Prompt setup remains the same) ...
+        if audio_prompt_paths:
+            if isinstance(audio_prompt_paths, str):
+                audio_prompt_paths = [audio_prompt_paths] * batch_size
+            elif len(audio_prompt_paths) == 1:
+                audio_prompt_paths = audio_prompt_paths * batch_size
+            self.prepare_conditionals_batch(audio_prompt_paths, exaggeration=exaggeration, norm_loudness=norm_loudness)
         else:
-            assert self.conds is not None, "Please `prepare_conditionals` first or specify `audio_prompt_path`"
+             assert hasattr(self, 'conds_batch'), "Please call prepare_conditionals_batch first"
 
-        if cfg_weight > 0.0 or exaggeration > 0.0 or min_p > 0.0:
-            logger.warning("CFG, min_p and exaggeration are not supported by Turbo version and will be ignored.")
+        t3_conds = self.conds_batch["t3"]
+        s3gen_refs = self.conds_batch["gen_list"]
 
-        # Norm and tokenize text
-        text = punc_norm(text)
-        text_tokens = self.tokenizer(text, return_tensors="pt", padding=True, truncation=True)
-        text_tokens = text_tokens.input_ids.to(self.device)
+        # --- Tokenize with Padding & Attention Mask ---
+        cleaned_texts = [punc_norm(t) for t in texts]
+        
+        # returns 'input_ids' AND 'attention_mask'
+        tokenized_output = self.tokenizer(cleaned_texts, return_tensors="pt", padding=True, truncation=True)
+        
+        text_tokens = tokenized_output.input_ids.to(self.device)
+        attention_mask = tokenized_output.attention_mask.to(self.device)
 
-        speech_tokens = self.t3.inference_turbo(
-            t3_cond=self.conds.t3,
+        # --- Batch Inference (Pass Mask) ---
+        speech_tokens_batch = self.t3.inference_turbo(
+            t3_cond=t3_conds,
             text_tokens=text_tokens,
+            attention_mask=attention_mask,  # <--- NEW
             temperature=temperature,
             top_k=top_k,
             top_p=top_p,
             repetition_penalty=repetition_penalty,
         )
 
-        # Remove OOV tokens and add silence to end
-        speech_tokens = speech_tokens[speech_tokens < 6561]
-        speech_tokens = speech_tokens.to(self.device)
+        # --- Sequential S3Gen & Cleanup ---
+        generated_wavs = []
         silence = torch.tensor([S3GEN_SIL, S3GEN_SIL, S3GEN_SIL]).long().to(self.device)
-        speech_tokens = torch.cat([speech_tokens, silence])
+        stop_token = self.t3.hp.stop_speech_token
 
-        wav, _ = self.s3gen.inference(
-            speech_tokens=speech_tokens,
-            ref_dict=self.conds.gen,
-            n_cfm_timesteps=2,
-        )
-        wav = wav.squeeze(0).detach().cpu().numpy()
-        watermarked_wav = self.watermarker.apply_watermark(wav, sample_rate=self.sr)
-        return torch.from_numpy(watermarked_wav).unsqueeze(0)
+        for i in range(batch_size):
+            sequence = speech_tokens_batch[i]
+            
+            # --- Cleanup Logic (Solves Garbage) ---
+            eot_indices = (sequence == stop_token).nonzero(as_tuple=True)[0]
+            if len(eot_indices) > 0:
+                cutoff = eot_indices[0]
+                sequence = sequence[:cutoff]
+            
+            sequence = sequence[sequence < 6561] # Remove OOVs
+            sequence = torch.cat([sequence, silence])
+            
+            if len(sequence) <= 3:
+                generated_wavs.append(torch.zeros(1, 16000))
+                continue
+
+            # Sequential Vocoder (Safe)
+            sequence = sequence.unsqueeze(0)
+            wav, _ = self.s3gen.inference(
+                speech_tokens=sequence,
+                ref_dict=s3gen_refs[i],
+                n_cfm_timesteps=2,
+            )
+            wav = wav.squeeze(0).detach().cpu().numpy()
+            watermarked_wav = self.watermarker.apply_watermark(wav, sample_rate=self.sr)
+            generated_wavs.append(torch.from_numpy(watermarked_wav).unsqueeze(0))
+
+        return generated_wavs
