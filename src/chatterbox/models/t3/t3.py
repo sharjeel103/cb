@@ -1,5 +1,3 @@
-# Copyright (c) 2025 Resemble AI
-# MIT License
 import logging
 from typing import Union, Optional, List
 
@@ -410,6 +408,184 @@ class T3(nn.Module):
         # Concatenate all predicted tokens along the sequence dimension.
         predicted_tokens = torch.cat(predicted, dim=1)  # shape: (B, num_tokens)
         return predicted_tokens
+    @torch.inference_mode()
+    def inference_batch(
+        self,
+        t3_cond: T3Cond,
+        text_tokens: Tensor,
+        attention_mask: Optional[Tensor] = None,
+        max_new_tokens=1000,
+        temperature=0.8,
+        top_p=0.95,
+        min_p=0.05,
+        repetition_penalty=1.2,
+        cfg_weight=0.5,
+    ):
+        """
+        Batch-enabled inference for standard T3 model (Non-Turbo).
+        Supports CFG and variable length sequences.
+        """
+        batch_size = text_tokens.size(0)
+        device = text_tokens.device
+
+        # --- 1. Expand for CFG ---
+        # If CFG is enabled, we need 2x batch size: [Cond_1, Uncond_1, Cond_2, Uncond_2, ...]
+        do_cfg = cfg_weight > 0.0
+        
+        if do_cfg:
+            # Interleave expansion: [A, B] -> [A, A, B, B]
+            text_tokens = text_tokens.repeat_interleave(2, dim=0)
+            if attention_mask is not None:
+                attention_mask = attention_mask.repeat_interleave(2, dim=0)
+            
+            # Expand Conditionals manually
+            t3_cond_expanded = T3Cond(
+                speaker_emb=t3_cond.speaker_emb.repeat_interleave(2, dim=0),
+                cond_prompt_speech_tokens=t3_cond.cond_prompt_speech_tokens.repeat_interleave(2, dim=0) if t3_cond.cond_prompt_speech_tokens is not None else None,
+                emotion_adv=t3_cond.emotion_adv.repeat_interleave(2, dim=0),
+            )
+            if hasattr(t3_cond, 'cond_prompt_speech_emb') and t3_cond.cond_prompt_speech_emb is not None:
+                 t3_cond_expanded.cond_prompt_speech_emb = t3_cond.cond_prompt_speech_emb.repeat_interleave(2, dim=0)
+            t3_cond = t3_cond_expanded
+
+        # --- 2. Input Preparation ---
+        # We start with [SOT] token
+        initial_speech_tokens = self.hp.start_speech_token * torch.ones((text_tokens.size(0), 1), dtype=torch.long, device=device)
+
+        # Prepare Embeddings (Pass cfg_weight=0 to avoid hardcoded single-batch logic in prepare_input_embeds)
+        embeds, len_cond = self.prepare_input_embeds(
+            t3_cond=t3_cond,
+            text_tokens=text_tokens,
+            speech_tokens=initial_speech_tokens,
+            cfg_weight=0.0, 
+        )
+
+        # Apply Unconditional Zeroing manually for Batched CFG
+        # Unconditional is every 2nd element: Indices 1, 3, 5...
+        if do_cfg and not self.is_gpt:
+            # embeds shape: [Batch, Seq, Dim]
+            # We want to zero out the TEXT portion of the unconditional rows
+            # Structure: [Cond | Text | Speech]
+            # Text starts at len_cond, ends at len_cond + text_len
+            text_start = len_cond
+            text_end = len_cond + text_tokens.size(1)
+            embeds[1::2, text_start:text_end, :] = 0.0
+
+        # Construct Attention Mask
+        if attention_mask is not None:
+            # [Cond (1) | Text (mask) | Speech (1)]
+            cond_mask = torch.ones((text_tokens.size(0), len_cond), dtype=torch.long, device=device)
+            speech_mask = torch.ones((text_tokens.size(0), 1), dtype=torch.long, device=device)
+            combined_mask = torch.cat([cond_mask, attention_mask, speech_mask], dim=1)
+        else:
+            combined_mask = None
+
+        # --- 3. Setup Logits Processors ---
+        logits_processors = LogitsProcessorList()
+        if temperature != 1.0:
+            logits_processors.append(TemperatureLogitsWarper(temperature))
+        if top_p < 1.0:
+            logits_processors.append(TopPLogitsWarper(top_p))
+        if min_p > 0.0:
+            logits_processors.append(MinPLogitsWarper(min_p))
+        repetition_processor = RepetitionPenaltyLogitsProcessor(penalty=repetition_penalty)
+
+        # --- 4. Prepare Generation Backend ---
+        self.compiled = False
+        if not self.compiled:
+            # (Keeping alignment analyzer logic optionally None for simplicity unless needed)
+            alignment_stream_analyzer = None 
+            
+            patched_model = T3HuggingfaceBackend(
+                config=self.cfg,
+                llama=self.tfmr,
+                speech_enc=self.speech_emb,
+                speech_head=self.speech_head,
+                alignment_stream_analyzer=alignment_stream_analyzer,
+            )
+            self.patched_model = patched_model
+            self.compiled = True
+        
+        inputs_embeds = embeds
+
+        output = self.patched_model(
+            inputs_embeds=inputs_embeds,
+            past_key_values=None,
+            use_cache=True,
+            output_attentions=True,
+            output_hidden_states=True,
+            return_dict=True,
+        )
+        past = output.past_key_values
+
+        generated_ids = initial_speech_tokens.clone() # (2B, 1) or (B, 1)
+        generated_speech_tokens = [] # Store only result tokens
+        
+        unfinished_sequences = torch.ones(batch_size, dtype=torch.bool, device=device)
+
+        # --- 6. Generation Loop ---
+        for i in tqdm(range(max_new_tokens), desc="T3 Gen", leave=False):
+            logits_step = output.logits[:, -1, :] # (Batch_Size_Actual, Vocab)
+
+            # CFG Combination
+            if do_cfg:
+                # Split Cond and Uncond
+                cond_logits = logits_step[0::2]
+                uncond_logits = logits_step[1::2]
+                logits = cond_logits + cfg_weight * (cond_logits - uncond_logits)
+            else:
+                logits = logits_step
+
+            # Repetition Penalty (Needs IDs mapped back to single batch size if CFG)
+            # We track generated_ids in full size (2B), so we slice for penalty calculation
+            ids_for_proc = generated_ids[0::2] if do_cfg else generated_ids
+            logits = repetition_processor(ids_for_proc, logits)
+
+            # Sampling
+            logits = logits_processors(ids_for_proc, logits)
+            probs = torch.softmax(logits, dim=-1)
+            next_token = torch.multinomial(probs, num_samples=1) # (B, 1)
+
+            # Batch Stopping Logic
+            is_eos = (next_token.view(-1) == self.hp.stop_speech_token)
+            newly_finished = unfinished_sequences & is_eos
+            unfinished_sequences = unfinished_sequences & ~newly_finished
+            
+            # Force EOS for finished
+            next_token[~unfinished_sequences] = self.hp.stop_speech_token
+            
+            generated_speech_tokens.append(next_token)
+
+            if not unfinished_sequences.any():
+                break
+
+            # Prepare Input for Next Step
+            # Expand next_token back to 2B if CFG
+            if do_cfg:
+                next_token_input = next_token.repeat_interleave(2, dim=0)
+            else:
+                next_token_input = next_token
+
+            # Update history
+            generated_ids = torch.cat([generated_ids, next_token_input], dim=1)
+
+            # Embedding
+            next_token_embed = self.speech_emb(next_token_input)
+            if self.speech_pos_emb is not None:
+                next_token_embed = next_token_embed + self.speech_pos_emb.get_fixed_embedding(i + 1)
+            
+            # Forward
+            output = self.patched_model(
+                inputs_embeds=next_token_embed,
+                past_key_values=past,
+                output_attentions=True,
+                output_hidden_states=True,
+                return_dict=True,
+            )
+            past = output.past_key_values
+
+        all_tokens = torch.cat(generated_speech_tokens, dim=1)
+        return all_tokens
 
     @torch.inference_mode()
     def inference_turbo(self, t3_cond, text_tokens, attention_mask=None, temperature=0.8, top_k=1000, top_p=0.95, repetition_penalty=1.2,
