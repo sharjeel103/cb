@@ -16,6 +16,8 @@ import soundfile as sf
 import parselmouth
 from scipy.signal import butter, filtfilt
 
+# Import T3Cond to reconstruct conditional objects
+from .models.t3.modules.cond_enc import T3Cond
 from .tts import ChatterboxTTS
 
 # ==========================================
@@ -30,7 +32,7 @@ CHUNK_SIZE_DEFAULT = 275
 SAFE_BATCH_SIZE = 4         
 
 # ==========================================
-#      TEXT PROCESSING UTILS
+#      TEXT PROCESSING UTILS (Identical)
 # ==========================================
 ABBREVIATIONS = {
     "mr.", "mrs.", "ms.", "dr.", "prof.", "rev.", "hon.", "st.", "etc.", "e.g.", "i.e.",
@@ -178,7 +180,7 @@ def chunk_text_by_sentences(full_text: str, chunk_size: int) -> List[str]:
 
 
 # ==========================================
-#      AUDIO PROCESSING UTILS
+#      AUDIO PROCESSING UTILS (Identical)
 # ==========================================
 
 def trim_lead_trail_silence(audio_array: np.ndarray, sample_rate: int, silence_thresh_db: float = -40.0, padding_ms: int = 50) -> np.ndarray:
@@ -306,7 +308,94 @@ class RobustChatterboxTTS(ChatterboxTTS):
     2. Internal batching (filling VRAM by flattening all text chunks).
     3. Robust OOM recovery.
     4. Post-processing tools.
+    5. Fixed conditional padding to prevent batch size mismatches.
     """
+    
+    # --- FIX: OVERRIDE prepare_conditionals_batch ---
+    def prepare_conditionals_batch(self, wav_fpaths: list[str], exaggeration=0.5):
+        """
+        Overridden to ensure tokens are padded to exactly 'speech_cond_prompt_len'.
+        This prevents 'RuntimeError: Sizes of tensors must match' during torch.cat.
+        """
+        if isinstance(wav_fpaths, str):
+            wav_fpaths = [wav_fpaths]
+            
+        S3GEN_SR = 24000 # Hardcoded from s3gen/const.py
+        S3_SR = 16000    # Hardcoded from s3tokenizer
+
+        t3_conds_list = []
+        gen_refs_list = []
+
+        plen = self.t3.hp.speech_cond_prompt_len
+        pad_token = getattr(self.t3.hp, 'stop_speech_token', 0)
+
+        for wav_fpath in wav_fpaths:
+            # 1. Load Reference
+            s3gen_ref_wav, _sr = librosa.load(wav_fpath, sr=S3GEN_SR)
+            # 2. Resample
+            ref_16k_wav = librosa.resample(s3gen_ref_wav, orig_sr=S3GEN_SR, target_sr=S3_SR)
+
+            # Float32 Casting
+            ref_16k_tensor = torch.from_numpy(ref_16k_wav).float()
+            s3gen_ref_wav_tensor = torch.from_numpy(s3gen_ref_wav).float()
+
+            # 3. S3Gen Embedding
+            s3gen_ref_wav_trunc = s3gen_ref_wav_tensor[:self.DEC_COND_LEN]
+            s3gen_ref_dict = self.s3gen.embed_ref(s3gen_ref_wav_trunc, S3GEN_SR, device=self.device)
+            gen_refs_list.append(s3gen_ref_dict)
+
+            # 4. T3 Conditioning with PADDING FIX
+            t3_cond_prompt_tokens = None
+            if plen:
+                s3_tokzr = self.s3gen.tokenizer
+                
+                # Get raw tokens from tokenizer (might be shorter than plen)
+                t3_cond_prompt_tokens, _ = s3_tokzr.forward([ref_16k_tensor[:self.ENC_COND_LEN]], max_len=plen)
+                t3_cond_prompt_tokens = torch.atleast_2d(t3_cond_prompt_tokens).to(self.device)
+                
+                # --- PADDING LOGIC ---
+                curr_len = t3_cond_prompt_tokens.shape[1]
+                if curr_len < plen:
+                    # Pad to exact length
+                    pad_amount = plen - curr_len
+                    t3_cond_prompt_tokens = F.pad(t3_cond_prompt_tokens, (0, pad_amount), value=pad_token)
+                elif curr_len > plen:
+                    # Trim if somehow longer
+                    t3_cond_prompt_tokens = t3_cond_prompt_tokens[:, :plen]
+                # ---------------------
+
+            # Voice Encoder
+            ref_16k_numpy_float = ref_16k_wav.astype("float32")
+            ve_embed = torch.from_numpy(self.ve.embeds_from_wavs([ref_16k_numpy_float], sample_rate=S3_SR))
+            ve_embed = ve_embed.mean(axis=0, keepdim=True).to(self.device).float()
+
+            t3_cond_item = T3Cond(
+                speaker_emb=ve_embed,
+                cond_prompt_speech_tokens=t3_cond_prompt_tokens,
+                emotion_adv=exaggeration * torch.ones(1, 1, 1).to(self.device),
+            )
+            t3_conds_list.append(t3_cond_item)
+
+        # --- Collate Batch ---
+        batched_speaker_emb = torch.cat([c.speaker_emb for c in t3_conds_list], dim=0)
+        
+        if t3_conds_list[0].cond_prompt_speech_tokens is not None:
+            batched_speech_tokens = torch.cat([c.cond_prompt_speech_tokens for c in t3_conds_list], dim=0)
+        else:
+            batched_speech_tokens = None
+            
+        batched_emotion = torch.cat([c.emotion_adv for c in t3_conds_list], dim=0)
+        
+        batched_t3_cond = T3Cond(
+            speaker_emb=batched_speaker_emb,
+            cond_prompt_speech_tokens=batched_speech_tokens,
+            emotion_adv=batched_emotion,
+        )
+        
+        self.conds_batch = {
+            "t3": batched_t3_cond,
+            "gen_list": gen_refs_list
+        }
 
     def prepare_reference_robust(self, audio_path: str) -> str:
         """Checks duration of reference audio and crops if necessary."""
@@ -361,13 +450,6 @@ class RobustChatterboxTTS(ChatterboxTTS):
     ) -> List[np.ndarray]:
         """
         Process multiple input texts, breaking them into chunks, and filling GPU batches efficiently.
-        
-        Args:
-            texts: List of full text strings to synthesize.
-            audio_prompts: Single path (str) applied to all, or List[str] matching len(texts).
-            
-        Returns:
-            List[np.ndarray]: One audio array per input text (at model.sr).
         """
         if seed_num != 0:
             set_seed(int(seed_num))
@@ -387,16 +469,14 @@ class RobustChatterboxTTS(ChatterboxTTS):
         # Pre-process references (cropping)
         final_ref_paths = [self.prepare_reference_robust(p) for p in ref_paths]
 
-        # 2. Phase 1: Flatten everything into chunks (Internal Batching Prep)
-        # We need to map: Flat Batch Index -> (Original Request Index, Stitch Order Index)
-        flat_batch_items = []  # List of dicts: {'text': chunk_str, 'ref': path, 'req_idx': int, 'chunk_idx': int}
+        # 2. Phase 1: Flatten everything into chunks
+        flat_batch_items = []
         
         for req_idx, (text, ref_path) in enumerate(zip(texts, final_ref_paths)):
             cleaned_text = text.replace('",', '" ').replace('",', '" ')
             chunks = chunk_text_by_sentences(cleaned_text, chunk_size=CHUNK_SIZE_DEFAULT)
             
             if not chunks:
-                # Handle empty text case (store a placeholder/None or skip)
                 continue
                 
             for chunk_idx, chunk_text in enumerate(chunks):
@@ -411,8 +491,7 @@ class RobustChatterboxTTS(ChatterboxTTS):
         if total_flat_items == 0:
             return [np.zeros(16000, dtype=np.float32) for _ in range(num_requests)]
 
-        # 3. Phase 2: Process Flat List in Optimal GPU Batches
-        # Adjust batch size based on CFG
+        # 3. Phase 2: Process Flat List
         if cfg_weight > 0.0:
             current_target_batch = target_batch_size 
         else:
@@ -421,21 +500,22 @@ class RobustChatterboxTTS(ChatterboxTTS):
         current_batch_size = current_target_batch
         flat_idx = 0
         
-        # Store results: map[req_idx] -> list of (chunk_idx, audio_np)
         generated_chunks_map = defaultdict(list)
-        engine_sr = self.sr # Default if not set yet
+        engine_sr = self.sr
 
         with torch.inference_mode():
             while flat_idx < total_flat_items:
                 end_idx = min(flat_idx + current_batch_size, total_flat_items)
                 batch_slice = flat_batch_items[flat_idx : end_idx]
                 
-                # Extract lists for the model
                 batch_texts_in = [item['text'] for item in batch_slice]
                 batch_refs_in = [item['ref'] for item in batch_slice]
                 
+                # --- CALL PREPARE_CONDITIONALS_BATCH (Our fixed version) ---
+                # generate_batch calls this internally, but it calls self.prepare_conditionals_batch
+                # which is now overridden on 'self'.
+                
                 try:
-                    # CALL BASE MODEL
                     wav_tensors = self.generate_batch(
                         batch_texts_in,
                         audio_prompt_paths=batch_refs_in,
@@ -449,7 +529,6 @@ class RobustChatterboxTTS(ChatterboxTTS):
                     
                     if hasattr(self, 'sr'): engine_sr = self.sr
                     
-                    # Distribute results back to map
                     for i, wav_tensor in enumerate(wav_tensors):
                         audio_np = wav_tensor.cpu().numpy().squeeze()
                         meta = batch_slice[i]
@@ -458,10 +537,8 @@ class RobustChatterboxTTS(ChatterboxTTS):
                         )
                         del wav_tensor
                     
-                    # Advance
                     flat_idx += len(batch_slice)
                     
-                    # Restore batch size if it was lowered by OOM
                     if current_batch_size < current_target_batch:
                          current_batch_size = current_target_batch
                     
@@ -486,23 +563,19 @@ class RobustChatterboxTTS(ChatterboxTTS):
                     else:
                         raise e
 
-        # 4. Phase 3: Stitching & Post-Processing per Request
+        # 4. Phase 3: Stitching
         final_outputs = []
         
         for i in range(num_requests):
-            # Get chunks for this request
             chunk_list = generated_chunks_map.get(i, [])
             
             if not chunk_list:
-                # Fallback silence
                 final_outputs.append(np.zeros(int(engine_sr), dtype=np.float32))
                 continue
                 
-            # Sort by chunk_idx to ensure correct order
             chunk_list.sort(key=lambda x: x[0])
             audio_segments = [x[1] for x in chunk_list]
             
-            # Stitch
             full_audio = stitch_audio_segments(audio_segments, engine_sr, sentence_pause_s)
             
             if full_audio is None:
@@ -510,7 +583,6 @@ class RobustChatterboxTTS(ChatterboxTTS):
                 
             full_audio = full_audio.astype(np.float32)
 
-            # Post-Process
             if trim_silence:
                 full_audio = trim_lead_trail_silence(full_audio, engine_sr)
             if fix_int_silence:
@@ -529,7 +601,6 @@ class RobustChatterboxTTS(ChatterboxTTS):
 
     def generate_robust(self, *args, **kwargs):
         """Wrapper for single-text backward compatibility."""
-        # This just calls generate_batch_robust with a list of 1
         if 'text' in kwargs:
             text = kwargs.pop('text')
         else:
@@ -537,7 +608,6 @@ class RobustChatterboxTTS(ChatterboxTTS):
             args = args[1:]
         
         audio_prompt_path = kwargs.get('audio_prompt_path', None)
-        # Handle positional arg for prompt if present
         if len(args) > 0:
             audio_prompt_path = args[0]
 
