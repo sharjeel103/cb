@@ -28,6 +28,7 @@ dependencies = [
     "soundfile>=0.12.0",
     "scipy>=1.10.0",
     "praat-parselmouth>=0.4.0", # Required for 'remove_unvoiced' feature
+    "protobuf<4"
 ]
 
 [project.urls]
