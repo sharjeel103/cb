@@ -19,47 +19,58 @@ from .models.t3.modules.cond_enc import T3Cond
 REPO_ID = "ResembleAI/chatterbox"
 
 
+import re
+
 def punc_norm(text: str) -> str:
     """
-        Quick cleanup func for punctuation from LLMs or
-        containing chars not seen often in the dataset
+    Robust cleanup function using Regex to handle edge cases, 
+    weird spacing, and repeated punctuation.
     """
-    if len(text) == 0:
+    if not text or len(text.strip()) == 0:
         return "You need to add some text for me to talk."
 
-    # Capitalise first letter
-    if text[0].islower():
-        text = text[0].upper() + text[1:]
-
-    # Remove multiple space chars
+    # 1. Normalize Whitespace (tabs, newlines -> single space)
     text = " ".join(text.split())
 
-    # Replace uncommon/llm punc
-    punc_to_replace = [
-        ("...", ", "),
-        ("…", ", "),
-        (":", ","),
-        (" - ", ", "),
-        (";", ", "),
-        ("—", "-"),
-        ("–", "-"),
-        (" ,", ","),
-        ("“", "\""),
-        ("”", "\""),
-        ("‘", "'"),
-        ("’", "'"),
-    ]
-    for old_char_sequence, new_char in punc_to_replace:
-        text = text.replace(old_char_sequence, new_char)
+    # 2. Smart Quotes & Strange Dashes -> Standard ASCII
+    # Replace smart quotes with standard " and '
+    text = re.sub(r'[\u2018\u2019`]', "'", text) 
+    text = re.sub(r'[\u201C\u201D]', '"', text)
+    # Replace Em-dash (—) and En-dash (–) with simple comma (pause) or hyphen
+    # The original code mapped " - " to ", " (pause), so we preserve that intent globally
+    text = re.sub(r'\s*[-–—]\s*', ', ', text) 
 
-    # Add full stop if no ending punc
-    text = text.rstrip(" ")
-    sentence_enders = {".", "!", "?", "-", ","}
-    if not any(text.endswith(p) for p in sentence_enders):
+    # 3. Collapse Repeated Punctuation (The "Glitch Fix")
+    # "....." -> "."
+    text = re.sub(r'\.{2,}', '.', text)
+    # "!!!!" -> "!"
+    text = re.sub(r'!{2,}', '!', text)
+    # "?????" -> "?"
+    text = re.sub(r'\?{2,}', '?', text)
+    # ",,,,," -> ","
+    text = re.sub(r',{2,}', ',', text)
+
+    # 4. Map TTS-unfriendly Punctuation to Commas (Pauses)
+    # Colons and Semicolons often break flow; commas are safer for TTS prosody
+    text = re.sub(r'[:;]', ',', text)
+
+    # 5. Fix Spacing Around Punctuation
+    # "word , word" -> "word, word" (Remove space before)
+    text = re.sub(r'\s+([,.!?])', r'\1', text)
+    # "word,word" -> "word, word" (Ensure space after)
+    text = re.sub(r'([,.!?])(?=[a-zA-Z])', r'\1 ', text)
+
+    # 6. Final Cleanups
+    # Capitalize first letter
+    if text[0].islower():
+        text = text[0].upper() + text[1:]
+    
+    # Ensure it ends with punctuation
+    sentence_enders = {".", "!", "?", ","}
+    if text[-1] not in sentence_enders:
         text += "."
 
     return text
-
 
 @dataclass
 class Conditionals:
