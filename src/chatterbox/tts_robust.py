@@ -32,7 +32,7 @@ CHUNK_SIZE_DEFAULT = 275
 SAFE_BATCH_SIZE = 4         
 
 # ==========================================
-#      TEXT PROCESSING UTILS (Identical)
+#      TEXT PROCESSING UTILS
 # ==========================================
 ABBREVIATIONS = {
     "mr.", "mrs.", "ms.", "dr.", "prof.", "rev.", "hon.", "st.", "etc.", "e.g.", "i.e.",
@@ -180,7 +180,7 @@ def chunk_text_by_sentences(full_text: str, chunk_size: int) -> List[str]:
 
 
 # ==========================================
-#      AUDIO PROCESSING UTILS (Identical)
+#      AUDIO PROCESSING UTILS
 # ==========================================
 
 def trim_lead_trail_silence(audio_array: np.ndarray, sample_rate: int, silence_thresh_db: float = -40.0, padding_ms: int = 50) -> np.ndarray:
@@ -309,7 +309,52 @@ class RobustChatterboxTTS(ChatterboxTTS):
     3. Robust OOM recovery.
     4. Post-processing tools.
     5. Fixed conditional padding to prevent batch size mismatches.
+    6. Advanced Normalization Strategies (Peak & Limiter).
     """
+    
+    # --- NORMALIZATION STRATEGIES ---
+    def peak_normalize(self, audio: np.ndarray, target_peak=0.95) -> np.ndarray:
+        """
+        Vibe Voice Style: Safe, natural, but preserves dynamics (can be quiet).
+        """
+        peak = np.abs(audio).max()
+        if peak > 0:
+            return audio / peak * target_peak
+        return audio
+
+    def smart_limiter(self, audio: np.ndarray, target_loudness_db=-14, limit_threshold=0.99) -> np.ndarray:
+        """
+        Chatterbox/Loud Style: Boosts quiet parts, limits spikes. 
+        Solves 'Quiet Audio with Loud Spike' problem.
+        """
+        rms = np.sqrt(np.mean(audio**2))
+        if rms < 1e-6: return audio
+
+        # Calculate Boost Gain
+        target_rms = 10 ** (target_loudness_db / 20)
+        gain = target_rms / rms
+
+        # Apply Boost + Soft Clip (Tanh)
+        audio_boosted = audio * gain
+        audio_limited = np.tanh(audio_boosted)
+
+        # Final Safety Clamp
+        peak = np.abs(audio_limited).max()
+        if peak > limit_threshold:
+            audio_limited = audio_limited / peak * limit_threshold
+            
+        return audio_limited
+
+    def apply_normalization(self, audio: np.ndarray, strategy: Optional[str] = None) -> np.ndarray:
+        """
+        Public wrapper to apply normalization logic.
+        Strategies: 'peak', 'limiter', or None.
+        """
+        if strategy == "peak":
+            return self.peak_normalize(audio)
+        elif strategy == "limiter":
+            return self.smart_limiter(audio)
+        return audio
     
     # --- FIX: OVERRIDE prepare_conditionals_batch ---
     def prepare_conditionals_batch(self, wav_fpaths: list[str], exaggeration=0.5):
@@ -348,7 +393,6 @@ class RobustChatterboxTTS(ChatterboxTTS):
             t3_cond_prompt_tokens = None
             if plen:
                 s3_tokzr = self.s3gen.tokenizer
-                
                 # Get raw tokens from tokenizer (might be shorter than plen)
                 t3_cond_prompt_tokens, _ = s3_tokzr.forward([ref_16k_tensor[:self.ENC_COND_LEN]], max_len=plen)
                 t3_cond_prompt_tokens = torch.atleast_2d(t3_cond_prompt_tokens).to(self.device)
@@ -442,14 +486,15 @@ class RobustChatterboxTTS(ChatterboxTTS):
         repetition_penalty: float = 1.2,
         # Robust/Post-proc params
         sentence_pause_s: float = 0.2,
-        norm_loudness: bool = True,
+        normalization_strategy: Optional[str] = None, # 'peak', 'limiter', or None
         trim_silence: bool = False,
         fix_int_silence: bool = False,
         remove_unvoiced: bool = False,
         target_batch_size: int = 12
     ) -> List[np.ndarray]:
         """
-        Process multiple input texts, breaking them into chunks, and filling GPU batches efficiently.
+        Process multiple input texts with robust batching and normalization options.
+        normalization_strategy: 'peak', 'limiter', or None (default).
         """
         if seed_num != 0:
             set_seed(int(seed_num))
@@ -510,10 +555,6 @@ class RobustChatterboxTTS(ChatterboxTTS):
                 
                 batch_texts_in = [item['text'] for item in batch_slice]
                 batch_refs_in = [item['ref'] for item in batch_slice]
-                
-                # --- CALL PREPARE_CONDITIONALS_BATCH (Our fixed version) ---
-                # generate_batch calls this internally, but it calls self.prepare_conditionals_batch
-                # which is now overridden on 'self'.
                 
                 try:
                     wav_tensors = self.generate_batch(
@@ -590,10 +631,8 @@ class RobustChatterboxTTS(ChatterboxTTS):
             if remove_unvoiced:
                 full_audio = remove_long_unvoiced(full_audio, engine_sr)
             
-            if norm_loudness:
-                peak = np.abs(full_audio).max()
-                if peak > 0:
-                    full_audio = full_audio / peak * PEAK_NORMALIZE_TARGET
+            # --- NORMALIZATION (Using new method) ---
+            full_audio = self.apply_normalization(full_audio, strategy=normalization_strategy)
             
             final_outputs.append(full_audio)
 
