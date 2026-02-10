@@ -322,7 +322,7 @@ class RobustChatterboxTTS(ChatterboxTTS):
             return audio / peak * target_peak
         return audio
 
-    def smart_limiter(self, audio: np.ndarray, target_loudness_db=-14, limit_threshold=0.99) -> np.ndarray:
+    def smart_limiter(self, audio: np.ndarray, target_loudness_db=-14, limit_threshold=0.95) -> np.ndarray:
         """
         Chatterbox/Loud Style: Boosts quiet parts, limits spikes. 
         Solves 'Quiet Audio with Loud Spike' problem.
