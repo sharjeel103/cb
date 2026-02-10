@@ -487,8 +487,8 @@ class RobustChatterboxTTS(ChatterboxTTS):
         # Robust/Post-proc params
         sentence_pause_s: float = 0.2,
         normalization_strategy: Optional[str] = None, # 'peak', 'limiter', or None
-        target_peak=0.95
-        limit_threshold=0.95
+        target_peak=0.95,
+        limit_threshold=0.95,
         trim_silence: bool = False,
         fix_int_silence: bool = False,
         remove_unvoiced: bool = False,
