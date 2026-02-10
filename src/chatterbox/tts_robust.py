@@ -345,15 +345,15 @@ class RobustChatterboxTTS(ChatterboxTTS):
             
         return audio_limited
 
-    def apply_normalization(self, audio: np.ndarray, strategy: Optional[str] = None) -> np.ndarray:
+    def apply_normalization(self, audio: np.ndarray, strategy: Optional[str] = None, target_peak=0.95, limit_threshold=0.95 ) -> np.ndarray:
         """
         Public wrapper to apply normalization logic.
         Strategies: 'peak', 'limiter', or None.
         """
         if strategy == "peak":
-            return self.peak_normalize(audio)
+            return self.peak_normalize(audio, target_peak=target_peak)
         elif strategy == "limiter":
-            return self.smart_limiter(audio)
+            return self.smart_limiter(audio, limit_threshold=limit_threshold)
         return audio
     
     # --- FIX: OVERRIDE prepare_conditionals_batch ---
@@ -487,6 +487,8 @@ class RobustChatterboxTTS(ChatterboxTTS):
         # Robust/Post-proc params
         sentence_pause_s: float = 0.2,
         normalization_strategy: Optional[str] = None, # 'peak', 'limiter', or None
+        target_peak=0.95
+        limit_threshold=0.95
         trim_silence: bool = False,
         fix_int_silence: bool = False,
         remove_unvoiced: bool = False,
@@ -632,7 +634,7 @@ class RobustChatterboxTTS(ChatterboxTTS):
                 full_audio = remove_long_unvoiced(full_audio, engine_sr)
             
             # --- NORMALIZATION (Using new method) ---
-            full_audio = self.apply_normalization(full_audio, strategy=normalization_strategy)
+            full_audio = self.apply_normalization(full_audio, strategy=normalization_strategy, target_peak=target_peak, limit_threshold=limit_threshold)
             
             final_outputs.append(full_audio)
 
